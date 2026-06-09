@@ -1,0 +1,3 @@
+{"id": "1", "input": "Write a Python function to reverse a string, then write a unit test for it.", "expected_keywords": ["def", "reverse", "assert"]}
+{"id": "2", "input": "Explain gradient descent, then give a concrete numerical example.", "expected_keywords": ["learning rate", "gradient", "example"]}
+{"id": "3", "input": "List three sorting algorithms, then implement the fastest one for nearly-sorted data.", "expected_keywords": ["insertion", "O(n)", "def"]}
