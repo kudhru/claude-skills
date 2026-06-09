@@ -60,30 +60,70 @@ const results = await Promise.allSettled(
 );
 ```
 
-### One agent per sample — OpenAI models
+### One subprocess per sample — OpenAI models
 
 Use this pattern when `--model` is an OpenAI model (`gpt-*`, `o1`, `o3`, `o4-mini`, etc.):
 
-Each agent runs a shell command via `codex exec`. The agent receives a single shell tool and the command to run:
+**Do not spawn Claude agents for OpenAI models.** Call `codex exec` directly via `child_process.spawn`. No Claude agents are created, so there is no double cost.
+
+Because the workflow runtime does not cap subprocess concurrency the way it caps agents (max 16), add a simple semaphore to avoid hitting OpenAI rate limits.
 
 ```javascript
+const { spawn } = require('child_process');
+
+// Limit concurrent codex exec calls (adjust to stay within your rate limit)
+const CODEX_CONCURRENCY = 8;
+let _running = 0;
+const _queue = [];
+function withLimit(fn) {
+  return new Promise((resolve, reject) => {
+    const tryRun = () => {
+      if (_running < CODEX_CONCURRENCY) {
+        _running++;
+        fn().then(
+          r => { _running--; resolve(r); _queue.length && _queue.shift()(); },
+          e => { _running--; reject(e);  _queue.length && _queue.shift()(); }
+        );
+      } else {
+        _queue.push(tryRun);
+      }
+    };
+    tryRun();
+  });
+}
+
+function codexExec(model, systemPrompt, userPrompt) {
+  return withLimit(() => new Promise((resolve, reject) => {
+    // Verify exact flags with: codex exec --help
+    // Common flags: --model, --quiet, --system-prompt (if supported), positional prompt
+    const args = ['exec', '--model', model, '--quiet', userPrompt];
+    const proc = spawn('codex', args, { env: { ...process.env } });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', d => stdout += d.toString());
+    proc.stderr.on('data', d => stderr += d.toString());
+    proc.on('close', code => {
+      if (code === 0) resolve(stdout.trim());
+      else reject(new Error(stderr.trim() || `codex exec exited with code ${code}`));
+    });
+    proc.on('error', reject);
+  }));
+}
+
 const results = await Promise.allSettled(
-  dataset.map(sample => {
-    const escaped = sample.prompt.replace(/'/g, "'\\''");
-    return agent(
-      `Run exactly this command and return its stdout verbatim, nothing else:\n\ncodex exec --model <MODEL_ID> --quiet '<SYSTEM_PROMPT>' '${escaped}'`,
-      { tools: ['Bash'] }
-    ).then(output => ({
-      id: sample.id,
-      input: sample.prompt,
-      output: output.trim(),
-      expected: sample.expected ?? null,
-    }));
-  })
+  dataset.map(sample =>
+    codexExec('<MODEL_ID>', 'You are a helpful assistant.', sample.prompt)
+      .then(output => ({
+        id: sample.id,
+        input: sample.prompt,
+        output,
+        expected: sample.expected ?? null,
+      }))
+  )
 );
 ```
 
-Replace `<SYSTEM_PROMPT>` with whatever system prompt the evaluation requires (e.g. `You are a helpful assistant.`).
+**Note on system prompt:** if `codex exec` supports `--system-prompt` or `-s`, pass it as a flag instead of prepending it to the user prompt. Check `codex exec --help` and adapt accordingly.
 
 ### Flatten results and write output
 
@@ -192,11 +232,10 @@ Show the complete workflow script. Propose running it as a dynamic workflow so t
 
 ## Constraints
 
-- The runtime runs at most 16 agents concurrently (enforced automatically).
-- Max 1,000 agents per run. If `dataset.length > 1000`, add a note and slice accordingly.
-- Do not add tools to evaluation agents unless the user explicitly requests it.
+- **Claude models:** the runtime caps concurrent agents at 16 (enforced automatically). Max 1,000 agents per run. If `dataset.length > 1000`, add a note and slice accordingly.
+- **OpenAI models:** `codex exec` runs as direct subprocesses — no agent cap applies. Use the `withLimit` semaphore to control concurrency and avoid OpenAI rate limits. Default is 8; adjust based on the model's rate limit tier.
+- Do not add tools to evaluation agents (Claude path) unless the user explicitly requests it.
 - Always write results to a file — do not rely on console output for large runs.
-- For OpenAI models, the `codex exec` flag `--quiet` suppresses spinner output. Adjust if the installed version uses different flags.
 
 ## Examples
 
